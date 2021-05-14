@@ -44,15 +44,26 @@ bl_info = {
 }
 
 # Face flags
-FLAG_DITHERING = 1
-FLAG_TRANSPARENCY = 2
-FLAG_IGNORE_FACE_SIZE = 4
+FLAG_DITHERING          = 1
+FLAG_TRANSPARENCY       = 2
+FLAG_IGNORE_FACE_SIZE   = 4
+FLAG_GOURAUD            = 8
+FLAG_SHADOW             = 16
 EXPORTER_SETTINGS_NAME = 'saturn_ssm_exporter_settings' 
+
+TEXTURE_WRITE_TEXTURE_STR = '__texture__'
+TEXTURE_WRITE_ATLAS_STR   = '__atlas__'
+TEXTURE_WRITE_NONE        = 'textureWriteNone'
+TEXTURE_WRITE_TEX_ONLY    = TEXTURE_WRITE_TEXTURE_STR
+TEXTURE_WRITE_ATLAS_ONLY  = TEXTURE_WRITE_ATLAS_STR
+TEXTURE_WRITE_TEX_ATLAS   = '{}&&{}'.format(TEXTURE_WRITE_TEXTURE_STR,
+                                            TEXTURE_WRITE_ATLAS_STR)
+
 
 # Fields to save/load on exporter dialog
 exportFields = ['filepath', 'animActions', 'checkForDuplicatedTextures',
                 'useAO', 'texturesSizeByArea', 'minimumTextureSize',
-                'outputTextureSize', 'saveLogFile']
+                'outputTextureSize', 'saveLogFile', 'textureWriteOptions']
 
 # Hold BMesh for each mesh.
 globalMeshes = {}
@@ -219,7 +230,16 @@ def setArmaturePose(armature, pose):
   armature.data.update_tag()
   context.scene.frame_set(context.scene.frame_current)
 
-def getPoseData(obj, previousSelection):
+class PoseBone:
+  def __init__(self, name, head, tail, euler):
+    self.name = name
+    self.head = head
+    self.tail = tail
+    self.euler = euler
+    self.numVertices = 0
+    self.numFaces = 0
+
+def getPoseData(obj):
   if not obj.parent or obj.parent.type != 'ARMATURE':
     return None
   
@@ -227,7 +247,6 @@ def getPoseData(obj, previousSelection):
     
   # Toggle rest position
   oldPosition = armature.data.pose_position
-  selectObj(armature)
   setArmaturePose(armature, 'REST')
   
   bones = armature.pose.bones.values()
@@ -235,15 +254,14 @@ def getPoseData(obj, previousSelection):
   poseData['bones'] = []
   for bone in bones:
     invertedEuler = getEditBoneInverseEuler(bone)
-    poseData['bones'].append([bone.name,
-                              copy.deepcopy(bone.head),
-                              copy.deepcopy(bone.tail),
-                              invertedEuler,
-                              0,   # numVertices
-                              0])  # numFaces
+    head = copy.deepcopy(bone.head)
+    tail = copy.deepcopy(bone.tail)
+    poseData['bones'].append(PoseBone(bone.name,
+                                      head,
+                                      tail,
+                                      invertedEuler))
            
   setArmaturePose(armature, oldPosition)
-  selectObj(previousSelection)
     
   poseData['vertices'] = []
   objMesh = obj.to_mesh()
@@ -256,7 +274,7 @@ def getPoseData(obj, previousSelection):
     poseData['vertices'].append(boneIndex)
 
     assert boneIndex < len(poseData['bones']), 'BoneIndex out of bounds'
-    poseData['bones'][boneIndex][4] += 1
+    poseData['bones'][boneIndex].numVertices += 1
 
   # Calculate number of faces per bone
   objMesh = getMeshForFaceIteration(obj)
@@ -266,7 +284,7 @@ def getPoseData(obj, previousSelection):
     boneIndex = getVertexBoneIndex(obj, armature, firstVertex)
 
     assert boneIndex < len(poseData['bones']), 'BoneIndex out of bounds'
-    poseData['bones'][boneIndex][5] += 1
+    poseData['bones'][boneIndex].numFaces += 1
     
   return poseData
 
@@ -276,19 +294,23 @@ def getAnimation(obj, actionName):
   
   armature = obj.parent
   action = bpy.data.actions[actionName]
+
+  originalAction = armature.animation_data.action
+  armature.animation_data.action = action
   frame_range = action.frame_range
   saveFrame = copy.deepcopy(bpy.context.scene.frame_current)
   
   frames = []
-  for index in range(int(frame_range[0]), int(frame_range[1]) + 1):
+  for index in range(int(frame_range[0]), int(frame_range[1])):
     bpy.context.scene.frame_set(index)
     newFrame = []
     for boneIndex, bone in enumerate(armature.pose.bones):
       euler, position = getPoseBoneEuler(bone)
       newFrame.append([boneIndex, bone.name, position, euler])
-    
+
     frames.append(copy.deepcopy(newFrame))
     
+  armature.animation_data.action = originalAction
   bpy.context.scene.frame_set(saveFrame)
   return frames
 
@@ -299,8 +321,9 @@ class ExportSegaSaturnModel(bpy.types.Operator):
   """Export blender objects to Sega Saturn model"""
   bl_idname = "export.to_saturn"
   bl_label = "Export Saturn Model (.SSM)"
+  bl_options = {'PRESET'}
   filepath: bpy.props.StringProperty(subtype='FILE_PATH')
-  animActions: bpy.props.StringProperty(name="Animation Actions", 
+  animActions: bpy.props.StringProperty(name="Actions", 
                                         description="Comma separated list of actions to export")
                                         
   checkForDuplicatedTextures: bpy.props.BoolProperty(name="Check for duplicated textures",
@@ -332,7 +355,21 @@ class ExportSegaSaturnModel(bpy.types.Operator):
                                            max = 128,
                                            min = 2,
                                            step = 2)
-    
+  
+  textureWriteOptionsEnum = [
+    (TEXTURE_WRITE_ATLAS_ONLY,        'Atlas Only', ''),
+    (  TEXTURE_WRITE_TEX_ONLY,      'Texture Only', ''),
+    ( TEXTURE_WRITE_TEX_ATLAS, 'Texture and Atlas', ''),
+    (      TEXTURE_WRITE_NONE,              'None', '')]
+
+  textureWriteOptions: bpy.props.EnumProperty(items=textureWriteOptionsEnum,
+                                              name="Texture Export",
+                                              description="",
+                                              default = 0)
+
+  dontSaveSettings: bpy.props.BoolProperty(name="Dont save settings",
+                                           description="Dont save those settings",
+                                           default = False)
 
   # Keep textures by hash.
   modelTextures = {}
@@ -367,15 +404,16 @@ class ExportSegaSaturnModel(bpy.types.Operator):
     return bpy.context.selected_objects is not None
 
   def findMinimumScale(self):
-    selObjects = bpy.context.selected_objects
+    assert len(bpy.context.selected_objects) > 0, 'No models selected'
+    obj = bpy.context.selected_objects[0]
+    objMesh = obj.data
+    
     smallestValue = sys.float_info.max
-    for obj in selObjects:
-      objMesh = obj.data
-      for f in objMesh.polygons:
-        for v in f.vertices:
-          smallestValue = min(objMesh.vertices[v].co[0], smallestValue)
-          smallestValue = min(objMesh.vertices[v].co[1], smallestValue)
-          smallestValue = min(objMesh.vertices[v].co[2], smallestValue)
+    for f in objMesh.polygons:
+      for v in f.vertices:
+        smallestValue = min(objMesh.vertices[v].co[0], smallestValue)
+        smallestValue = min(objMesh.vertices[v].co[1], smallestValue)
+        smallestValue = min(objMesh.vertices[v].co[2], smallestValue)
 
     scale = 1.0
     while abs(smallestValue * scale) < 1.0:
@@ -385,26 +423,26 @@ class ExportSegaSaturnModel(bpy.types.Operator):
     return scale
       
   def getMaximumArea(self):
-    selObjects = bpy.context.selected_objects
-
+    assert len(bpy.context.selected_objects) > 0, 'No models selected'
+    obj = bpy.context.selected_objects[0]
+    objMesh = getMeshForFaceIteration(obj)
+    
     area = 0
-    for obj in selObjects:
-      objMesh = getMeshForFaceIteration(obj)
-      if objMesh.faces.layers.int.get("FaceFlags") is None:
-        objMesh.faces.layers.int.new("FaceFlags")
-        
-      flagsLayer = objMesh.faces.layers.int.get("FaceFlags")
-      for polygon in objMesh.faces:
-        if (polygon[flagsLayer] & FLAG_IGNORE_FACE_SIZE) != 0:
-          continue
+    if objMesh.faces.layers.int.get("FaceFlags") is None:
+      objMesh.faces.layers.int.new("FaceFlags")
+      
+    flagsLayer = objMesh.faces.layers.int.get("FaceFlags")
+    for polygon in objMesh.faces:
+      if (polygon[flagsLayer] & FLAG_IGNORE_FACE_SIZE) != 0:
+        continue
 
-        faceArea = polygon.calc_area()
-        if faceArea > area:
-          area = faceArea
+      faceArea = polygon.calc_area()
+      if faceArea > area:
+        area = faceArea
       
     return area
 
-  def writeFacesForFrame(self, frameIndex, filePtr, logFilePtr):
+  def writeFaces(self, filePtr, logFilePtr):
     self.facesOffset = filePtr.tell()
     if logFilePtr:
       logFilePtr.write("=============================================\n")
@@ -415,83 +453,82 @@ class ExportSegaSaturnModel(bpy.types.Operator):
     totalIndex = 0
     vertexCount = 0
     faceIndex = 0
-    selObjects = bpy.context.selected_objects
 
-    for obj in selObjects:
-      objMesh = getMeshForFaceIteration(obj)
-      if objMesh.faces.layers.int.get("FaceFlags") is None:
-        objMesh.faces.layers.int.new("FaceFlags")
-        
-      flagsLayer = objMesh.faces.layers.int.get("FaceFlags")
-      if logFilePtr:
-        logFilePtr.write("Obj '{}' faces start at vertex index {}\n".format(obj.name, vertexCount))
-
-      for polyIndex, poly in enumerate(objMesh.faces):
-        indices = []
-        if len(poly.loops) == 3:
-          indices = [loop.index for loop in poly.loops[0:3]]
-        elif len(poly.loops) == 4:
-          indices = [loop.index for loop in poly.loops[0:4]]
-
-        for loop_index in reversed(indices):
-          index = ctypes.c_uint16(ntohs(obj.data.loops[loop_index].vertex_index + vertexCount))
-          filePtr.write(index)
-
-        if len(poly.loops) == 3:
-          index = ctypes.c_uint16(ntohs(obj.data.loops[indices[0]].vertex_index + vertexCount))
-          filePtr.write(index)
-
-        filePtr.write(ctypes.c_uint16(ntohs(self.faceTextures[faceIndex])))
-        filePtr.write(ctypes.c_uint8(self.faceTextureSizes[faceIndex]))
-        filePtr.write(ctypes.c_uint8(poly[flagsLayer]))
-        writeBlenderVector(filePtr, poly.normal)
-
-        if logFilePtr:
-          logIndices = [obj.data.loops[x].vertex_index + vertexCount for x in indices]
-          if len(logIndices) == 3:
-            logIndices.append(logIndices[0])
-
-          logStr = '{} / IDX {}, {}, {}, {} / TEX {} / TEXSIZE {} / FLAG {} / N {}\n'
-          logFilePtr.write(logStr.format(polyIndex,
-                                         *logIndices,
-                                         self.faceTextureSizes[faceIndex],
-                                         self.faceTextureSizes[faceIndex],
-                                         poly[flagsLayer],
-                                         str(poly.normal)))
-
-        faceIndex += 1
-        totalIndex += 4
+    assert len(bpy.context.selected_objects) > 0, 'No models selected'
+    obj = bpy.context.selected_objects[0]
+    objMesh = getMeshForFaceIteration(obj)
+    if objMesh.faces.layers.int.get("FaceFlags") is None:
+      objMesh.faces.layers.int.new("FaceFlags")
       
-      # Add vertex count of active mesh to increase indices on next
-      # object.
-      vertexCount += len(obj.data.vertices)
+    flagsLayer = objMesh.faces.layers.int.get("FaceFlags")
+    if logFilePtr:
+      logFilePtr.write("Obj '{}' faces start at vertex index {}\n".format(obj.name, vertexCount))
 
-  def writeVerticesForFrame(self, frameIndex, filePtr, logFilePtr):
+    for polyIndex, poly in enumerate(objMesh.faces):
+      indices = []
+      if len(poly.loops) == 3:
+        indices = [loop.index for loop in poly.loops[0:3]]
+      elif len(poly.loops) == 4:
+        indices = [loop.index for loop in poly.loops[0:4]]
+
+      for loop_index in reversed(indices):
+        index = ctypes.c_uint16(ntohs(obj.data.loops[loop_index].vertex_index + vertexCount))
+        filePtr.write(index)
+
+      if len(poly.loops) == 3:
+        index = ctypes.c_uint16(ntohs(obj.data.loops[indices[0]].vertex_index + vertexCount))
+        filePtr.write(index)
+
+      filePtr.write(ctypes.c_uint16(ntohs(self.faceTextures[faceIndex])))
+      filePtr.write(ctypes.c_uint8(self.faceTextureSizes[faceIndex]))
+      filePtr.write(ctypes.c_uint8(poly[flagsLayer]))
+      writeBlenderVector(filePtr, poly.normal)
+
+      if logFilePtr:
+        logIndices = [obj.data.loops[x].vertex_index + vertexCount for x in indices]
+        if len(logIndices) == 3:
+          logIndices.append(logIndices[0])
+
+        logStr = '{} / IDX {}, {}, {}, {} / TEX {} / TEXSIZE {} / FLAG {} / N {}\n'
+        logFilePtr.write(logStr.format(polyIndex,
+                                       *logIndices,
+                                       self.faceTextureSizes[faceIndex],
+                                       self.faceTextureSizes[faceIndex],
+                                       poly[flagsLayer],
+                                       str(poly.normal)))
+
+      faceIndex += 1
+      totalIndex += 4
+    
+    # Add vertex count of active mesh to increase indices on next
+    # object.
+    vertexCount += len(obj.data.vertices)
+
+  def writeVertices(self, filePtr, logFilePtr):
     self.verticesOffset = filePtr.tell()
 
     if logFilePtr:
       logFilePtr.write("=============================================\n")
       logFilePtr.write("Starting writing vertices at {} ({})".format(self.verticesOffset,
                                                                      hex(self.verticesOffset)))
+    assert len(bpy.context.selected_objects) > 0, 'No models selected'
+    obj = bpy.context.selected_objects[0]
+    objMesh = obj.data
+    
     minimumScale = self.minimumScale
-    selObjects = bpy.context.selected_objects
-    for obj in selObjects:
-      objMesh = obj.data
+    if logFilePtr:
+      logFilePtr.write("{} vertices:\n".format(obj.name))
+
+    for vIndex, v in enumerate(objMesh.vertices):
+      copyV = v.co.copy()
+      writeBlenderVector(filePtr, copyV * minimumScale)
       if logFilePtr:
-        logFilePtr.write("{} vertices:\n".format(obj.name))
-
-      for vIndex, v in enumerate(objMesh.vertices):
-        fV0 = fixedPoint(v.co[0] * minimumScale)
-        fV1 = fixedPoint(-v.co[1] * minimumScale)
-        fV2 = fixedPoint(v.co[2] * minimumScale)
-
-        filePtr.write(fV0)
-        filePtr.write(fV2)
-        filePtr.write(fV1)
-
-        if logFilePtr:
-          logFilePtr.write("{} = {} {} {}\n".format(vIndex, v.co[0], v.co[2], -v.co[1]))
-          logFilePtr.write("     {} {} {}\n".format(fV0.value, fV1.value, fV2.value))
+        logFilePtr.write("{} = {} {} {}\n".format(vIndex, v.co[0], v.co[2], -v.co[1]))
+  
+        fV0 = fixedPoint( copyV.x)
+        fV1 = fixedPoint( copyV.z)
+        fV2 = fixedPoint(-copyV.y)
+        logFilePtr.write("     {} {} {}\n".format(fV0.value, fV1.value, fV2.value))
 
 
   # Extract pixel values for the passed indices of a polygon.
@@ -587,18 +624,19 @@ class ExportSegaSaturnModel(bpy.types.Operator):
         
       self.modelTextureData.append( [ newTextureData[:], polygonIndex ] )
       self.faceTextures.append( polygonIndex )
-      newImageSavePath = Path(texturesDir / '{}.PNG'.format(polygonIndex))
-      newImage = bpy.data.images.new(name='tmpImg_{}'.format(polygonIndex),
-                                     width=outputWidth, 
-                                     height=outputHeight, 
-                                     alpha=False, 
-                                     float_buffer=True)
+      if self.textureWriteOptions.find(TEXTURE_WRITE_TEXTURE_STR) >= 0:
+        newImageSavePath = Path(texturesDir / '{}.PNG'.format(polygonIndex))
+        newImage = bpy.data.images.new(name='tmpImg_{}'.format(polygonIndex),
+                                       width=outputWidth, 
+                                       height=outputHeight, 
+                                       alpha=False, 
+                                       float_buffer=True)
 
-      newImage.pixels = outputBytes
-      newImage.filepath_raw = str(newImageSavePath)
-      newImage.file_format = 'PNG'
-      newImage.save()
-      bpy.data.images.remove(newImage)
+        newImage.pixels = outputBytes
+        newImage.filepath_raw = str(newImageSavePath)
+        newImage.file_format = 'PNG'
+        newImage.save()
+        bpy.data.images.remove(newImage)
 
     return reusedTexture
 
@@ -632,124 +670,126 @@ class ExportSegaSaturnModel(bpy.types.Operator):
     filePath = Path(self.filepath)
     filePathNoExt = filePath.parents[0] / filePath.stem
     filePathTexturesDir = filePath.parents[0] / filePath.stem
-    filePathTexturesDir.mkdir(parents=True, exist_ok=True)
+    if self.textureWriteOptions.find(TEXTURE_WRITE_TEXTURE_STR) >= 0:
+      filePathTexturesDir.mkdir(parents=True, exist_ok=True)
     
     if logFilePtr: 
       logFilePtr.write("=============================================\n")
       logFilePtr.write("TextureDir: {}\n".format(filePathTexturesDir))
 
-    selObjects = bpy.context.selected_objects
+    assert len(bpy.context.selected_objects) > 0, 'No models selected'
+    obj = bpy.context.selected_objects[0]
+    objData = obj.data
     polygonIndex = 0
-    for obj in selObjects:
-      objData = obj.data
 
-      # Extract pixels from UV.
-      assert len(objData.uv_layers) > 0, 'Object must have a UV channel'
-      uvLayer = objData.uv_layers[0].data
-      aoLayer = None
-      if self.useAO:
-        assert len(objData.uv_layers) > 1, 'Object must have a secondary UV channel'
-        aoLayer = objData.uv_layers[1].data
-      
-      for polyIndex, poly in enumerate(objData.polygons):
-        matIndex = poly.material_index
-        assert matIndex != None, 'Object must have a material'
-
-        textures = self.getTextures(objData, matIndex)
-        assert len(textures) > 0, 'Object material must have a texture'
-        assert hasattr(textures[0], 'image'), 'Object material must have a texture image'
-
-        texImgName = textures[0].image.name
-        imgData = bpy.data.images[texImgName]
-        width = imgData.size[0]
-        height = imgData.size[1]
-        bpp = imgData.channels
+    # Extract pixels from UV.
+    assert len(objData.uv_layers) > 0, 'Object must have a UV channel'
+    uvLayer = objData.uv_layers[0].data
+    aoLayer = None
+    if self.useAO:
+      assert len(objData.uv_layers) > 1, 'Object must have a secondary UV channel'
+      aoLayer = objData.uv_layers[1].data
     
-        outTextureSize = self.outputTextureSize
-        if self.texturesSizeByArea:
-          approximatedSize = (poly.area / self.largestArea) * self.outputTextureSize
-          outTextureSize = closePowerOf2(approximatedSize, self.outputTextureSize)
-          
-        if outTextureSize < self.minimumTextureSize:
-          outTextureSize = self.minimumTextureSize
+    for polyIndex, poly in enumerate(objData.polygons):
+      matIndex = poly.material_index
+      assert matIndex != None, 'Object must have a material'
 
-        if logFilePtr: 
-          logStr = "Face {} image '{}' ({}x{}@{} => {}x{})\n"
-          logFilePtr.write(logStr.format(polyIndex,
-                                         texImgName,
-                                         width,
-                                         height,
-                                         bpp,
-                                         self.outputTextureSize,
-                                         self.outputTextureSize))
+      textures = self.getTextures(objData, matIndex)
+      assert len(textures) > 0, 'Object material must have a texture'
+      assert hasattr(textures[0], 'image'), 'Object material must have a texture image'
 
-        # Extract pixels that way, otherwise it will be slow as hell 
-        # because we would be accessing bpy_prop_array instead of a list.
-        pixels = imgData.pixels[:]
-        imgProperties = [width, height, bpp, pixels]
+      texImgName = textures[0].image.name
+      imgData = bpy.data.images[texImgName]
+      width = imgData.size[0]
+      height = imgData.size[1]
+      bpp = imgData.channels
+    
+      outTextureSize = self.outputTextureSize
+      if self.texturesSizeByArea:
+        approximatedSize = (poly.area / self.largestArea) * self.outputTextureSize
+        outTextureSize = closePowerOf2(approximatedSize, self.outputTextureSize)
+        
+      if outTextureSize < self.minimumTextureSize:
+        outTextureSize = self.minimumTextureSize
 
-        assert bpp == 3 or bpp == 4, 'Only 24BPP or 32BPP images are supported'
-        indices = None
-        if len(poly.loop_indices) == 3:
-          indices = poly.loop_indices[0:3]
-        elif len(poly.loop_indices) == 4:
-          indices = poly.loop_indices[0:4]
+      if logFilePtr: 
+        logStr = "Face {} image '{}' ({}x{}@{} => {}x{})\n"
+        logFilePtr.write(logStr.format(polyIndex,
+                                       texImgName,
+                                       width,
+                                       height,
+                                       bpp,
+                                       self.outputTextureSize,
+                                       self.outputTextureSize))
 
-        aoTexture = None
-        if aoLayer != None:
-          aoImgName = textures[1].image.name
-          aoData = bpy.data.images[aoImgName]
-          assert imgData.channels == aoData.channels, 'Texture and AO must have the same bpp'
-          aoProperties = [aoData.size[0], aoData.size[1], aoData.channels, aoData.pixels[:]]
-          aoTexture = self.extractFaceTexturePixels(indices, aoLayer, 
-                                                    aoProperties, 
-                                                    outTextureSize)
+      # Extract pixels that way, otherwise it will be slow as hell 
+      # because we would be accessing bpy_prop_array instead of a list.
+      pixels = imgData.pixels[:]
+      imgProperties = [width, height, bpp, pixels]
+
+      assert bpp == 3 or bpp == 4, 'Only 24BPP or 32BPP images are supported'
+      indices = None
+      if len(poly.loop_indices) == 3:
+        indices = poly.loop_indices[0:3]
+      elif len(poly.loop_indices) == 4:
+        indices = poly.loop_indices[0:4]
+
+      aoTexture = None
+      if aoLayer != None:
+        aoImgName = textures[1].image.name
+        aoData = bpy.data.images[aoImgName]
+        assert imgData.channels == aoData.channels, 'Texture and AO must have the same bpp'
+        aoProperties = [aoData.size[0], aoData.size[1], aoData.channels, aoData.pixels[:]]
+        aoTexture = self.extractFaceTexturePixels(indices, aoLayer, 
+                                                  aoProperties, 
+                                                  outTextureSize)
 
 
-        assert indices != None, "Polygon must have 3 or 4 vertices"
-        reusedTexture = self.extractFaceTexture(polygonIndex, objData, 
-                                                indices, uvLayer, 
-                                                imgProperties, 
-                                                outTextureSize,
-                                                filePathTexturesDir, 
-                                                aoTexture, logFilePtr)
-          
-        if not reusedTexture:
-          polygonIndex += 1
+      assert indices != None, "Polygon must have 3 or 4 vertices"
+      reusedTexture = self.extractFaceTexture(polygonIndex, objData, 
+                                              indices, uvLayer, 
+                                              imgProperties, 
+                                              outTextureSize,
+                                              filePathTexturesDir, 
+                                              aoTexture, logFilePtr)
+        
+      if not reusedTexture:
+        polygonIndex += 1
 
     
   def writeAnimationHeader(self, filePtr, logFilePtr, poseData):
     bones = poseData['bones']
     vertices = poseData['vertices']
-    filePtr.write(ctypes.c_uint16(ntohs(len(bones))))
+    
+    # Count only bones that affect vertices
+    validBones = [b for b in bones if b.numVertices > 0 and b.numFaces > 0]
+    filePtr.write(ctypes.c_uint16(ntohs(len(validBones))))
     
     if logFilePtr:
       logFilePtr.write("=============================================\n")
-      logFilePtr.write("Bones ({}) starting at {} ({})\n".format(len(bones),
+      logFilePtr.write("Bones ({}) starting at {} ({})\n".format(len(validBones),
                                                                  filePtr.tell(),
                                                                  hex(filePtr.tell())))
 
-    for bIndex, bone in enumerate(bones):
-      name, start, tail, euler, numVertices, numFaces = bone
-      writeBlenderVector(filePtr, start)
-
-      sinEuler = applyOp(math.sin, euler)
-      cosEuler = applyOp(math.cos, euler)
+    for bIndex, bone in enumerate(validBones):
+      writeBlenderVector(filePtr, bone.head)
+      sinEuler = applyOp(math.sin, bone.euler)
+      cosEuler = applyOp(math.cos, bone.euler)
       writeVector(filePtr, sinEuler)
       writeVector(filePtr, cosEuler)
-      filePtr.write(ctypes.c_uint16(ntohs(numVertices)))
-      filePtr.write(ctypes.c_uint16(ntohs(numFaces)))
+      filePtr.write(ctypes.c_uint32(ntohl(bone.numVertices)))
+      filePtr.write(ctypes.c_uint32(ntohl(bone.numFaces)))
 
       if logFilePtr:
         logStr = "Bone {} '{}': START {} / EULER {} / VCOUNT: {} / FCOUNT: {}\n"
         logFilePtr.write(logStr.format(bIndex,
-                                       name,
-                                       start,
-                                       euler,
-                                       numVertices,
-                                       numFaces))
+                                       bone.name,
+                                       bone.head,
+                                       bone.euler,
+                                       bone.numVertices,
+                                       bone.numFaces))
 
-  def writeAnimation(self, filePtr, logFilePtr, animationData):
+  def writeAnimation(self, filePtr, logFilePtr, animationData, poseData):
     if logFilePtr:
       logFilePtr.write("=============================================\n")
       logStr = "Animation starting at {} ({}) with {} frames\n"
@@ -757,8 +797,8 @@ class ExportSegaSaturnModel(bpy.types.Operator):
                                      hex(filePtr.tell()),
                                      len(animationData)))
 
+    poseBones = poseData['bones']
     frames = animationData
-    filePtr.write(ctypes.c_uint16(ntohs(len(frames))))
     for frameIndex, frame in enumerate(frames):
       if logFilePtr:
         logStr = "Frame {} starting at {} ({})\n"
@@ -768,20 +808,25 @@ class ExportSegaSaturnModel(bpy.types.Operator):
 
       for bone in frame:
         index, name, position, euler = bone
-        if logFilePtr:
-          logFilePtr.write("  Bone {} - {} - {} - {}\n".format(*bone))
-          logFilePtr.write("  Matrix: {}\n".format(euler.to_matrix()))
+        poseBone = poseBones[index]
+        if poseBone.numVertices == 0 or poseBone.numFaces == 0:
+          if logFilePtr:
+            logFilePtr.write("  Skip Bone {} - {} - {} - {}\n".format(*bone))
+            logFilePtr.write("  Matrix: {}\n".format(euler.to_matrix()))
+        else:
+          if logFilePtr:
+            logFilePtr.write("  Bone {} - {} - {} - {}\n".format(*bone))
+            logFilePtr.write("  Matrix: {}\n".format(euler.to_matrix()))
 
-        eulerInverted = euler.to_matrix().inverted().to_euler()
-        writeVector(filePtr, position)
-        writeVector(filePtr, applyOp(math.sin, eulerInverted))
-        writeVector(filePtr, applyOp(math.cos, eulerInverted))
+          writeVector(filePtr, position)
+          writeVector(filePtr, applyOp(math.sin, euler))
+          writeVector(filePtr, applyOp(math.cos, euler))
 
       if logFilePtr:
         logFilePtr.write("\n")
 
   # Sort object vertices and faces by bone index, that makes the transformation cache efficient
-  def updateObjVerticesAndFaces(self, obj, selObjects):
+  def updateObjVerticesAndFaces(self, obj):
     if not obj.parent or obj.parent.type != 'ARMATURE':
       return
 
@@ -853,16 +898,17 @@ class ExportSegaSaturnModel(bpy.types.Operator):
     
     faceCount = 0
     vertexCount = 0
-    selObjects = bpy.context.selected_objects
-    for obj in selObjects:
-      self.updateObjVerticesAndFaces(obj, selObjects)
-      objMesh = obj.data
-      objMesh.update()
-      objMesh.calc_tangents()
-      vertexCount += len(objMesh.vertices)
-      for f in objMesh.polygons:
-        assert len(f.vertices) == 3 or len(f.vertices) == 4, 'Only triangles and quads supported'
-        faceCount += 1
+
+    assert len(bpy.context.selected_objects) > 0, 'No models selected'
+    obj = bpy.context.selected_objects[0]
+    self.updateObjVerticesAndFaces(obj)
+    objMesh = obj.data
+    objMesh.update()
+    objMesh.calc_tangents()
+    vertexCount += len(objMesh.vertices)
+    for f in objMesh.polygons:
+      assert len(f.vertices) == 3 or len(f.vertices) == 4, 'Only triangles and quads supported'
+      faceCount += 1
 
     # Start writing to file
     filePtr.write(bytes([0x53, 0x41, 0x54, 0x2E]))
@@ -878,63 +924,65 @@ class ExportSegaSaturnModel(bpy.types.Operator):
     filePtr.write(ctypes.c_uint16(ntohs(0))) 
     filePtr.write(ctypes.c_uint16(ntohs(0))) 
 
-    # TODO: Support frames.
-    # Write number of frames
-    frameCount = 0
-    filePtr.write(ctypes.c_uint16(ntohs(frameCount)))
-    
-    if logFilePtr:
-      logFilePtr.write("FrameCount: {}\n".format(frameCount))
-
     # Extract textures and associate them with faces.
     self.extractModelTextures(logFilePtr)
 
     # Faces for frame
-    self.writeFacesForFrame(0, filePtr, logFilePtr)
+    self.writeFaces(filePtr, logFilePtr)
 
     # Vertices for frame
-    self.writeVerticesForFrame(0, filePtr, logFilePtr)
+    self.writeVertices(filePtr, logFilePtr)
 
     filePtr.seek(offsetInFileForOffsets, 0)
     filePtr.write(ctypes.c_uint16(ntohs(self.facesOffset))) 
     filePtr.write(ctypes.c_uint16(ntohs(self.verticesOffset))) 
 
     # Write texture atlas.
-    self.writeTextureAtlas(logFilePtr)
+    if self.textureWriteOptions.find(TEXTURE_WRITE_ATLAS_STR) >= 0:
+      self.writeTextureAtlas(logFilePtr)
 
   def writeModelAnimationData(self, context, filePtr, logFilePtr):
-    selObjects = bpy.context.selected_objects
-    for selected in selObjects:    
-      poseData = getPoseData(selected, selected)
-      if poseData and logFilePtr:
-        logFilePtr.write("=============================================\n")
-        logFilePtr.write('Model has pose data, writing\n')
+    assert len(bpy.context.selected_objects) > 0, 'No models selected'
+    obj = bpy.context.selected_objects[0]
+    poseData = getPoseData(obj)
+    if poseData and logFilePtr:
+      logFilePtr.write("=============================================\n")
+      logFilePtr.write('Model has pose data, writing\n')
 
-      allActions = self.animActions.split(",")
-      hasActions = False
+    allActions = self.animActions.split(",")
+    hasActions = False
+    for animName in allActions:
+      if animName in bpy.data.actions:
+        hasActions = True
+        break
+      
+    if hasActions and poseData:
+      filePath = Path(self.filepath).with_suffix('.SSA')
+      if logFilePtr:
+        logFilePtr.write("Saving SSA to '{}'\n".format(self.filepath))
+        
+      allAnimationData = []
+      totalNumFrames = 0
       for animName in allActions:
-        if animName in bpy.data.actions:
-          hasActions = True
-          break
-        
-      if hasActions and poseData:
-        filePath = Path(self.filepath).with_suffix('.SSA')
-        if logFilePtr:
-          logFilePtr.write("Saving SSA to '{}'\n".format(self.filepath))
+        animationData = getAnimation(obj, animName)
+        allAnimationData.append(animationData)
+        if animationData is not None:
+          totalNumFrames += len(animationData)
 
-        with filePath.open("wb") as filePtr:
-          filePtr.write(bytes([0x53, 0x41, 0x54, 0x2E]))    
-          self.writeAnimationHeader(filePtr, logFilePtr, poseData)
+      with filePath.open("wb") as filePtr:
+        filePtr.write(bytes([0x53, 0x41, 0x54, 0x2E]))    
+        self.writeAnimationHeader(filePtr, logFilePtr, poseData)
+        filePtr.write(ctypes.c_uint16(ntohs(totalNumFrames)))
 
-          for animName in allActions:
-            if logFilePtr:
-              logFilePtr.write('Animation {}\n'.format(animName))
+        for index, animName in enumerate(allActions):
+          if logFilePtr:
+            logFilePtr.write('Animation {}\n'.format(animName))
 
-            animationData = getAnimation(selected, animName)
-            if animationData == None:
-              continue
-        
-            self.writeAnimation(filePtr, logFilePtr, animationData)
+          animationData = allAnimationData[index]
+          if animationData == None:
+            continue
+      
+          self.writeAnimation(filePtr, logFilePtr, animationData, poseData)
     
   def execute(self, context):
     filePath = Path(self.filepath)
@@ -956,8 +1004,9 @@ class ExportSegaSaturnModel(bpy.types.Operator):
 
     # Save dialog settings
     settings = context.scene[EXPORTER_SETTINGS_NAME]
-    for field in exportFields:
-      settings[field] = getattr(self, field)
+    if not self.dontSaveSettings:
+      for field in exportFields:
+        settings[field] = getattr(self, field)
 
     bpy.context.window_manager.popup_menu(drawSuccessMessage,
                                           title='Export finished',
@@ -989,6 +1038,40 @@ def setDithering(self, context):
       face[layer] |= FLAG_DITHERING
     else:
       face[layer] &= ~FLAG_DITHERING
+
+  return None
+
+def setGouraud(self, context):
+  editObject = context.edit_object
+  bm = globalMeshes.setdefault(editObject.name, 
+                               bmesh.from_edit_mesh(editObject.data))
+
+  for face in bm.faces:
+    if face.select == False:
+      continue
+
+    layer = bm.faces.layers.int.get("FaceFlags")
+    if bpy.context.window_manager.useGouraud:
+      face[layer] |= FLAG_GOURAUD
+    else:
+      face[layer] &= ~FLAG_GOURAUD
+
+  return None
+
+def setShadow(self, context):
+  editObject = context.edit_object
+  bm = globalMeshes.setdefault(editObject.name, 
+                               bmesh.from_edit_mesh(editObject.data))
+
+  for face in bm.faces:
+    if face.select == False:
+      continue
+
+    layer = bm.faces.layers.int.get("FaceFlags")
+    if bpy.context.window_manager.useShadow:
+      face[layer] |= FLAG_SHADOW
+    else:
+      face[layer] &= ~FLAG_SHADOW
 
   return None
 
@@ -1036,6 +1119,12 @@ bpy.types.WindowManager.useTransparency = bpy.props.BoolProperty(name="Use Trans
 bpy.types.WindowManager.ignoreFaceSize = bpy.props.BoolProperty(name="Ignore Face Size", 
                                                                 update=setIgnoreFaceSize)
 
+bpy.types.WindowManager.useGouraud = bpy.props.BoolProperty(name="Gouraud", 
+                                                            update=setGouraud)
+
+bpy.types.WindowManager.useShadow = bpy.props.BoolProperty(name="Use Shadow", 
+                                                           update=setShadow)
+
 # Update window manager values
 def updateWMValues(bm):
   bm.faces.ensure_lookup_table()
@@ -1049,6 +1138,8 @@ def updateWMValues(bm):
     bpy.context.window_manager.useDithering = ((face[layer] & FLAG_DITHERING) != 0)
     bpy.context.window_manager.useTransparency = ((face[layer] & FLAG_TRANSPARENCY) != 0)
     bpy.context.window_manager.ignoreFaceSize = ((face[layer] & FLAG_IGNORE_FACE_SIZE) != 0)
+    bpy.context.window_manager.useGouraud = ((face[layer] & FLAG_GOURAUD) != 0)
+    bpy.context.window_manager.useShadow = ((face[layer] & FLAG_SHADOW) != 0)
 
   return None
 
@@ -1106,6 +1197,8 @@ class ROMULO_PT_SaturnEditPanel(bpy.types.Panel):
     self.layout.prop(context.window_manager, "useDithering", text="Use Dithering")
     self.layout.prop(context.window_manager, "useTransparency", text="Use Transparency")
     self.layout.prop(context.window_manager, "ignoreFaceSize", text="Ignore Face Size")
+    self.layout.prop(context.window_manager, "useGouraud", text="Gouraud")
+    self.layout.prop(context.window_manager, "useShadow", text="Shadow")
     
 
 def register():
