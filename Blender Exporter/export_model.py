@@ -1,4 +1,4 @@
-# Copyright 2020-2021 Romulo Fernandes Machado Leitao <romulo@castorgroup.net>
+# Copyright 2020-2022 Romulo Fernandes Machado Leitao <romulo@castorgroup.net>
 # 
 # Permission is hereby granted, free of charge, to any person obtaining a
 # copy of this software and associated documentation files (the "Software"),
@@ -30,7 +30,7 @@ import gpu
 import sys
 import socket
 from socket import ntohl
-from socket import ntohs
+from socket import ntohs, htons
 from bpy import *
 from math import *
 from mathutils import Vector
@@ -63,7 +63,8 @@ TEXTURE_WRITE_TEX_ATLAS   = '{}&&{}'.format(TEXTURE_WRITE_TEXTURE_STR,
 # Fields to save/load on exporter dialog
 exportFields = ['filepath', 'animActions', 'checkForDuplicatedTextures',
                 'useAO', 'texturesSizeByArea', 'minimumTextureSize',
-                'outputTextureSize', 'saveLogFile', 'textureWriteOptions']
+                'outputTextureSize', 'saveLogFile', 'textureWriteOptions',
+                'maxFramesPerAction']
 
 # Hold BMesh for each mesh.
 globalMeshes = {}
@@ -77,6 +78,15 @@ def interpolateUv(a, b, amount):
   dist1 = b[1] - a[1]
   newUv[1] = a[1] + (amount * dist1)
   return newUv
+
+def writeEuler16(filePtr, euler):
+  toInt = lambda x: int(x * 65536.0 + (0.5 if x >= 0 else -0.5))
+  x = toInt(euler.x) >> 3
+  y = toInt(euler.y) >> 3
+  z = toInt(euler.z) >> 3
+  filePtr.write(ctypes.c_int16(ntohs(ctypes.c_uint16(x).value)))
+  filePtr.write(ctypes.c_int16(ntohs(ctypes.c_uint16(y).value)))
+  filePtr.write(ctypes.c_int16(ntohs(ctypes.c_uint16(z).value)))
 
 def writeVector(filePtr, v):
   filePtr.write(fixedPoint(v.x))
@@ -191,9 +201,8 @@ def getColor(color):
               (color[1] * 255), (int)(color[2] * 255)]
   return (intColor[0] << 16) | (intColor[1] << 8) | intColor[2]
 
-
 def fixedPoint(value):
-  convertedValue = int(value * 65536.0)
+  convertedValue = int(value * 65536.0 + (0.5 if value >= 0 else -0.5))
   return ctypes.c_int32(ntohl(ctypes.c_uint32(convertedValue).value))
 
 def applyOp(func, data):
@@ -267,7 +276,8 @@ def getPoseData(obj):
   objMesh = obj.to_mesh()
   for v in objMesh.vertices:
     vGroup = v.groups[0]
-    assert vGroup.weight >= 1.0, 'Only 1.0 weighted vertices are allowed'
+    assert vGroup.weight >= 1.0, ('Only 1.0 weighted vertices '
+                                  'are allowed ({} given)'.format(vGroup.weight))
 
     boneName = obj.vertex_groups[vGroup.group].name
     boneIndex = armature.data.bones.find(boneName)
@@ -288,7 +298,7 @@ def getPoseData(obj):
     
   return poseData
 
-def getAnimation(obj, actionName):
+def getAnimation(obj, actionName, maxFramesPerAction):
   if not obj.parent or obj.parent.type != 'ARMATURE' or actionName not in bpy.data.actions:
     return None
   
@@ -297,11 +307,14 @@ def getAnimation(obj, actionName):
 
   originalAction = armature.animation_data.action
   armature.animation_data.action = action
-  frame_range = action.frame_range
+  frame_range = range(int(action.frame_range[0]), int(action.frame_range[1]))
+  if maxFramesPerAction > 0 and len(frame_range) > maxFramesPerAction:
+    frame_range = range(frame_range.start, frame_range.start + maxFramesPerAction)
+
   saveFrame = copy.deepcopy(bpy.context.scene.frame_current)
   
   frames = []
-  for index in range(int(frame_range[0]), int(frame_range[1])):
+  for index in frame_range:
     bpy.context.scene.frame_set(index)
     newFrame = []
     for boneIndex, bone in enumerate(armature.pose.bones):
@@ -325,6 +338,11 @@ class ExportSegaSaturnModel(bpy.types.Operator):
   filepath: bpy.props.StringProperty(subtype='FILE_PATH')
   animActions: bpy.props.StringProperty(name="Actions", 
                                         description="Comma separated list of actions to export")
+
+  maxFramesPerAction: bpy.props.IntProperty(name="Maximum Frames Per Action", 
+                                            description="Maximum number of frames to export (0 for all)",
+                                            default = 0,
+                                            min = 0)
                                         
   checkForDuplicatedTextures: bpy.props.BoolProperty(name="Check for duplicated textures",
                                                      description="Check for duplicated textures",
@@ -371,6 +389,10 @@ class ExportSegaSaturnModel(bpy.types.Operator):
                                            description="Dont save those settings",
                                            default = False)
 
+  ignoreLoadingSettings: bpy.props.BoolProperty(name="Ignore loading settings on dialog open",
+                                                description="Dont load those settings automatically",
+                                                default = False)
+
   # Keep textures by hash.
   modelTextures = {}
       
@@ -392,7 +414,7 @@ class ExportSegaSaturnModel(bpy.types.Operator):
   exportedVertices = 0
   
   def __init__(self):
-    if EXPORTER_SETTINGS_NAME in bpy.context.scene:
+    if not self.ignoreLoadingSettings and EXPORTER_SETTINGS_NAME in bpy.context.scene:
       settings = bpy.context.scene[EXPORTER_SETTINGS_NAME]
       for field in exportFields:
         if field in settings:
@@ -464,6 +486,7 @@ class ExportSegaSaturnModel(bpy.types.Operator):
     if logFilePtr:
       logFilePtr.write("Obj '{}' faces start at vertex index {}\n".format(obj.name, vertexCount))
 
+    # Write face attributes
     for polyIndex, poly in enumerate(objMesh.faces):
       indices = []
       if len(poly.loops) == 3:
@@ -471,34 +494,36 @@ class ExportSegaSaturnModel(bpy.types.Operator):
       elif len(poly.loops) == 4:
         indices = [loop.index for loop in poly.loops[0:4]]
 
+      writingIndices = []
       for loop_index in reversed(indices):
-        index = ctypes.c_uint16(ntohs(obj.data.loops[loop_index].vertex_index + vertexCount))
-        filePtr.write(index)
-
+        writingIndices.append(obj.data.loops[loop_index].vertex_index + vertexCount)
       if len(poly.loops) == 3:
-        index = ctypes.c_uint16(ntohs(obj.data.loops[indices[0]].vertex_index + vertexCount))
+        writingIndices.append(obj.data.loops[indices[0]].vertex_index + vertexCount)
+
+      for writeIndex in writingIndices:
+        index = ctypes.c_uint16(ntohs(writeIndex))
         filePtr.write(index)
 
       filePtr.write(ctypes.c_uint16(ntohs(self.faceTextures[faceIndex])))
       filePtr.write(ctypes.c_uint8(self.faceTextureSizes[faceIndex]))
       filePtr.write(ctypes.c_uint8(poly[flagsLayer]))
-      writeBlenderVector(filePtr, poly.normal)
 
       if logFilePtr:
-        logIndices = [obj.data.loops[x].vertex_index + vertexCount for x in indices]
-        if len(logIndices) == 3:
-          logIndices.append(logIndices[0])
-
-        logStr = '{} / IDX {}, {}, {}, {} / TEX {} / TEXSIZE {} / FLAG {} / N {}\n'
+        logStr = '{} / IDX {}, {}, {}, {} / TEX {} / TEXSIZE {} / FLAG {}\n'
         logFilePtr.write(logStr.format(polyIndex,
-                                       *logIndices,
+                                       *writingIndices,
                                        self.faceTextureSizes[faceIndex],
                                        self.faceTextureSizes[faceIndex],
-                                       poly[flagsLayer],
-                                       str(poly.normal)))
+                                       poly[flagsLayer]))
 
       faceIndex += 1
       totalIndex += 4
+
+    # Write face normals
+    for polyIndex, poly in enumerate(objMesh.faces):
+      writeBlenderVector(filePtr, poly.normal)
+      if logFilePtr:
+        logFilePtr.write('{} - Normal {}\n'.format(polyIndex, str(poly.normal)))
     
     # Add vertex count of active mesh to increase indices on next
     # object.
@@ -771,12 +796,14 @@ class ExportSegaSaturnModel(bpy.types.Operator):
                                                                  filePtr.tell(),
                                                                  hex(filePtr.tell())))
 
-    for bIndex, bone in enumerate(validBones):
+    for bone in validBones:
       writeBlenderVector(filePtr, bone.head)
       sinEuler = applyOp(math.sin, bone.euler)
       cosEuler = applyOp(math.cos, bone.euler)
       writeVector(filePtr, sinEuler)
       writeVector(filePtr, cosEuler)
+
+    for bIndex, bone in enumerate(validBones):
       filePtr.write(ctypes.c_uint32(ntohl(bone.numVertices)))
       filePtr.write(ctypes.c_uint32(ntohl(bone.numFaces)))
 
@@ -819,8 +846,7 @@ class ExportSegaSaturnModel(bpy.types.Operator):
             logFilePtr.write("  Matrix: {}\n".format(euler.to_matrix()))
 
           writeVector(filePtr, position)
-          writeVector(filePtr, applyOp(math.sin, euler))
-          writeVector(filePtr, applyOp(math.cos, euler))
+          writeEuler16(filePtr, euler)
 
       if logFilePtr:
         logFilePtr.write("\n")
@@ -911,7 +937,7 @@ class ExportSegaSaturnModel(bpy.types.Operator):
       faceCount += 1
 
     # Start writing to file
-    filePtr.write(bytes([0x53, 0x41, 0x54, 0x2E]))
+    filePtr.write(bytes([ord(x) for x in 'SAT.']))
     filePtr.write(ctypes.c_uint16(ntohs(faceCount)))
     filePtr.write(ctypes.c_uint16(ntohs(vertexCount)))
 
@@ -950,6 +976,7 @@ class ExportSegaSaturnModel(bpy.types.Operator):
       logFilePtr.write('Model has pose data, writing\n')
 
     allActions = self.animActions.split(",")
+    maxFramesPerAction = self.maxFramesPerAction
     hasActions = False
     for animName in allActions:
       if animName in bpy.data.actions:
@@ -964,13 +991,13 @@ class ExportSegaSaturnModel(bpy.types.Operator):
       allAnimationData = []
       totalNumFrames = 0
       for animName in allActions:
-        animationData = getAnimation(obj, animName)
+        animationData = getAnimation(obj, animName, maxFramesPerAction)
         allAnimationData.append(animationData)
         if animationData is not None:
           totalNumFrames += len(animationData)
 
       with filePath.open("wb") as filePtr:
-        filePtr.write(bytes([0x53, 0x41, 0x54, 0x2E]))    
+        filePtr.write(bytes([ord(x) for x in 'SAT.']))
         self.writeAnimationHeader(filePtr, logFilePtr, poseData)
         filePtr.write(ctypes.c_uint16(ntohs(totalNumFrames)))
 
@@ -1221,5 +1248,5 @@ def unregister():
 # This allows you to run the script directly from blenders text editor
 # to test the addon without having to install it.
 if __name__ == "__main__":
-    register()
+  register()
 
